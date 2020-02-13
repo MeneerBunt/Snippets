@@ -4,3 +4,7 @@ LoadPackages <- function(pkg){
     install.packages(new.pkg, dependencies = TRUE)
   sapply(pkg, require, character.only = TRUE)
 }
+
+#files <- list.files("./basic/", full.names = T)
+#sapply(files, source)
+#LoadPackages(c())
