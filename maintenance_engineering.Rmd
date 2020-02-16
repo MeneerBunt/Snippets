@@ -1,0 +1,630 @@
+---
+title: "PGA BSI-monitor"
+author: "Marco Bunt"
+date: "14 augustus 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width=12, fig.height=8, echo=FALSE, warning=FALSE, message=FALSE, fig.align="center", include = F)
+
+source('./Function/basic_functions/load_packages.R')
+source('./Function/main_functions/data_update/update_data_functions/connect_asset_to_outage.R')
+source('./Function/main_functions/calculate_risc/calculate_risc.R')
+
+update.data.functions <- c(list.files(path = './Function/main_functions/data_update/', pattern = ".R",full.names = T),
+                           list.files(path = './Function/main_functions/calculate_asset_risc/', pattern = ".R",full.names = T),
+                           list.files(path = './Function/main_functions/calculate_deformation/', pattern = ".R",full.names = T),
+                           list.files(path = './Function/main_functions/calculate_asset_risc/probability_functions/', full.names = T),
+                           list.files(path = './Function/main_functions/make_FO/', full.names = T))
+
+sapply(update.data.functions, source)
+LoadPackages(c("raster", "dplyr", "rgeos", "sf", "rgdal", "gstat", "stats", "ggplot2", "DiagrammeR", "maptools", "tidyr"))
+  
+epsg <- make_EPSG()
+amsf <- epsg$prj4[epsg$note == "# Amersfoort / RD New"]
+  
+options(scipen=999)
+
+# variabele
+horizon <- 50
+Pipeline.data.pga = "d:/Stedin/Data/Asset/PGA.txt"
+out.folder = './Output/'
+pga.parquet = "c:/EigenData/parquet/PGA_hist.parquet"
+year = as.numeric(format(Sys.time(), "%Y"))
+koppejan.distance = 750
+huidig.bsi <- 15.7
+
+periode <- 0:(horizon + 1)
+
+interest.rate <- 0.03 # Rentevoet voor NC-waarde bepaling: 3%
+cost.replacement  <- 1200 # kosten voor een vervanging
+
+NP <-  function(rt, t, i = interest.rate){ 
+    return( rt / ((1 + i)^t))}
+
+GC_roest = c("GC0","GC1","GC2","GC3","GC4","GC5","GC6","GC7","GC8", "GC9","GC10","GC11a",
+             "GC11b","GC12","GC13","GC14","GC15", "GC16","GC17","GC19","GC20a","GC21b","GC21c",
+             "GC21d","GC21e","GC22","GC23","GC20","GC24a","GC24b","GC25a","GC25b", "Onbekend")
+
+```
+
+```{r diagram, include=T}
+
+grViz("
+    digraph boxes_and_circles {
+    
+    graph [overlap = true, fontsize = 10]
+    
+    # csv input
+    node [shape = plaintext, fontname = Helvetica]
+    Nestor_files;sim_files
+    
+    # pipeline input/output
+    node [shape = plaintext, fontname = Helvetica]
+    V_inspection_Maximo; sms_files;
+    
+    PGA_ADWH; Soil_information;CBS_regions; Stedin_regions_ADWH;Groudwater_level;
+
+    ARP_shp;toestandwaardering_csv;bsi_monitor_csv
+    
+    # functions pipeline
+    node [shape = oval, fontname = Helvetica] // sets as circles
+    UpdateGasconnection_pipeline, join_data
+    
+    # functions R
+    node [shape = box, fontname = Helvetica] // sets as circles
+    LoadGasConnections; 
+    UpdateFailureData; 
+    ConnectAssetToOutage;
+    FailureEpidemic;
+    ConnectAssetToOutage;
+    UpdateInspections;
+    
+    CreateSoilCompositionRaster;
+    CreateInspectionRaster;
+    CreateTimeFactorRaster;
+    CreateSignageTimeRaster; 
+    
+    CreateRssRaster;
+    
+    CalculateRisc;
+    
+    FailureModeZakking;
+    FailureModeCorrosie;
+    FailureModeAlgemeen;
+    
+    calculate_optimal_replace;
+    
+    toestandwaardering_PGA;
+    
+    bsi_monitor
+    
+    # temp files
+    node [shape = diamond, fontname = Helvetica]
+    pga_parquet;PGA;
+    
+    storingen;PGA_model_data
+    
+    # output landing zone
+    node [shape = diamond, fontname = Helvetica, color = red]
+    storingen_PGA;v_inspectie;const_raster;rss_raster;time_factor_raster; inspection_raster; risc_table;hist_signage_raster;
+    pga_life_table;asset_replacement_prognose;bsi_table;PGA_toestandwaardering
+    
+    
+    #Model
+    PGA_ADWH->UpdateGasconnection_pipeline
+    Soil_information->UpdateGasconnection_pipeline
+    Groudwater_level->UpdateGasconnection_pipeline
+    CBS_regions->UpdateGasconnection_pipeline
+    Stedin_regions_ADWH->UpdateGasconnection_pipeline
+    
+    UpdateGasconnection_pipeline->pga_parquet 
+    
+    pga_parquet->LoadGasConnections->PGA
+    
+    PGA->CreateSignageTimeRaster->hist_signage_raster
+    
+    Nestor_files->UpdateFailureData->storingen->ConnectAssetToOutage->storingen_PGA
+    sim_files->UpdateFailureData
+    sms_files->UpdateFailureData
+    
+    storingen->CalculateRisc->risc_table
+    
+    PGA->ConnectAssetToOutage
+    
+    storingen_PGA->FailureEpidemic->PGA_model_data
+    
+    pga_parquet->UpdateInspections->v_inspectie
+    V_inspection_Maximo->UpdateInspections
+    hist_signage_raster->UpdateInspections
+    
+    v_inspectie->CreateSoilCompositionRaster->const_raster->join_data
+    v_inspectie->CreateRssRaster->rss_raste->join_data
+    v_inspectie->CreateInspectionRaster->inspection_raster->join_data
+    v_inspectie->CreateTimeFactorRaster->time_factor_raster->join_data
+    
+    PGA->join_data->PGA_model_data
+    
+    PGA_model_data->FailureModeZakking->pga_life_table->calculate_optimal_replace
+    PGA_model_data->FailureModeCorrosie->pga_life_table
+    PGA_model_data->FailureModeAlgemeen->pga_life_table ->bsi_monitor->bsi_table->bsi_monitor_csv
+    
+    risc_table->calculate_optimal_replace->asset_replacement_prognose->ARP_shp
+    
+    pga_life_table->toestandwaardering_PGA->PGA_toestandwaardering->toestandwaardering_csv
+    
+    }
+    ")
+
+```
+
+```{r Model description , include=FALSE}
+
+########################################################################################################
+
+# this function loads data from nestor and incedent-meldingen (SIM)
+
+# Packages:
+#   readr,       
+# 
+# Function:
+#   LoadPackages, easy loading Packages, './Function/basic_functions/load_packages.R'
+#   update.data.functions: subfunctions to convert outage data
+#
+# Args:
+#   Pipeline.data.pga: This is the data from the pipline. it is a join of the following data:
+#   - PGA "gevelconstrucie" table
+#   - Soil-type
+#   - Stedin regio
+#   - Ground deformation, raster (tiff) of "gronddeformatie". The vaules of this needs to be all negative, in contrast with the raster
+#     that also shows positive vaules. max value of the fiels is zero
+#   - Soilwater-level -- high
+#   - Soilwater-level -- low
+#   - BAG data
+#   - Type of "gevelconstructie" --> adding information abouth the GC to the asset, source: './Doc/Gevelconstructies.csv'
+#
+#
+# Returns:
+#   dataframe with the outage data
+
+#########################################################################################################
+
+```
+
+```{r Update data, include=FALSE}
+
+######### Update data ########################################################
+
+UpdateGasconnection(
+  PGA_source = Pipeline.data.pga,
+  PGA_Hist_par = pga.parquet,
+  HuidigJaar = year,
+  s = "c:\\EigenData\\data-apps\\spark",
+  h = "c:\\EigenData\\data-apps\\hadoop")
+
+```
+
+```{r load connections, include=FALSE}
+# from the parquet file, the PGA that are now in use are extracted.
+PGA <- LoadGasConnections(PGA_Hist_par = pga.parquet, s = "c:\\EigenData\\data-apps\\spark", h = "c:\\EigenData\\data-apps\\hadoop")
+saveRDS(PGA, paste0(out.folder, "PGA.Rds"))
+```
+
+```{r create signage-time raster, include=FALSE}
+# thsi is a rater with the time that we expect that the soil in deforming 
+signage.raster <- CreateSignageTimeRaster(pnt = PGA, out.folder = './Output/', raster.resolution = 10)
+
+```
+
+```{r UpdateFailureData, include=FALSE}
+storingen <- UpdateFailureData(
+  Nestor.files = './Input/storingsdatagas/',
+  sim.files = './Input/IncidentenGas/',
+  sms.files = './Input/SMS/SMS.csv',
+  Start = 2010,
+  HuidigJaar = year,
+  PGA_Hist_par = "c:/EigenData/parquet/PGA_hist.parquet",
+  s = "c:\\EigenData\\data-apps\\spark",
+  h = "c:\\EigenData\\data-apps\\hadoop",
+  out.files.location = out.folder)
+
+storingen.PGA <- ConnectAssetToOutage( Storingen[
+  which(storingen$Asset == "AL" & is.na(storingen$Relevantie)),
+  colnames(Storingen) %in% c("bron", "ID", "Postcode", "Huisnummer", "Datum", "JAAR",  
+                             "Schade_Maatschappelijk", "Schade_Veiligheid", "Schade_Financieel", "Relevantie",
+                             "StoringBron", "Oorzaak", "Veroorzaker", "Materiaal", "AssetType", "Asset", 
+                             "Druk", "Bros", "KwetsbaarObject", "BuisBreuk", "POST_C", "PLTS",
+                             "HUISNR", "StoringJaar", "GIS_ID", "EAN", "AssetSoort")], Huidigjaar = 2019, PGA_Hist_par, s, h) 
+
+saveRDS(object = storingen.PGA, file = paste0(out.files.location, "storingen.pga.Rds"))
+
+```
+
+```{r Inspecties, include=FALSE}
+v.inspectie <- UpdateInspections(
+  V_insp1 = './Input/V_inspectie/V_inspectie.csv',
+  V_insp2 = './Input/V_inspectie/V_inspectie_1.csv',
+  
+  PGA_Hist_par = pga.parquet,
+  Huidigjaar = year,
+  afst = koppejan.distance,
+  
+  s = "c:\\EigenData\\data-apps\\spark",
+  h = "c:\\EigenData\\data-apps\\hadoop",
+  out.files.location = out.folder,
+  signage.time.raster = signage.raster
+
+)
+
+```
+
+```{r FailureEpidemic, include=T}
+
+PGA.E <- FailureEpidemic(PGA, Inspecties = v.inspectie, storingen = storingen.pga, afst.zak = 250, afst.cor = 100)
+save(PGA.E, file = './tmp/PGA.E.Rda')
+```
+
+```{r defferd lifetime, include=T}
+TrainSinkagePrediction(
+  V_ins.h = v.inspectie[which(!is.na(v.inspectie$Zakking_Vins) & 
+                                v.inspectie$Zakking_Vins != "NA" & 
+                                v.inspectie$Zakking_Vins > 5 & 
+                                v.inspectie$Zakking_Vins < 150 & 
+                                !is.na(v.inspectie$Zakking_Sat)),],
+  train = F, test.size = 1500, pnt = PGA, create.raster = T )
+#```
+
+#```{r predict sinkage, include=FALSE}
+load(file = './Variables/sink.model.rda')
+summary(sink.model)
+
+rss.raster <- readRDS(file = './Output/rss.raster.Rds')
+signage.time.raster <- readRDS(file = './Output/signage.time.raster.Rds')
+correctie.raster <- readRDS(file = './Output/correctie.raster.Rds')
+insp.raster <- readRDS(file = './Output/insp.raster.Rds')
+time.factor.raster <- readRDS(file = './Output/time.factor.raster.Rds')
+    
+c <- raster::extract(correctie.raster, PGA, df=TRUE) 
+r <- raster::extract(rss.raster, PGA, df=TRUE) 
+t <- raster::extract(signage.time.raster, PGA, df=TRUE) 
+i <- raster::extract(insp.raster, PGA, df=TRUE) 
+tf <- raster::extract(time.factor.raster, PGA, df=TRUE) 
+
+PGA@data <- data.frame(PGA@data, correctie = c$correctie, rss = r$rss, aanvang.zetting = t$aanvang.zetting, insp = i$insp, time.factor = tf$time.factor)
+
+PGA[["Zakking_oud"]] <- PGA$Zakking_Tijd - PGA$Leeftijd
+PGA[["sinc.predict.koppejan"]] <- KoppejanDeformation(zakking.snelheid = PGA$Zakking_Sat, 
+                                                      t.2 = PGA$Zakking_Tijd, 
+                                                      t.1 = PGA$Zakking_Tijd - PGA$Leeftijd,
+                                                      c.1 = PGA$correctie, tan.h.cor = 200)
+hist(PGA$sinc.predict.koppejan, breaks = 50)
+
+PGA[["sinc.predict.glm"]] <- predict(sink.model, PGA@data, type = "response")
+PGA$sinc.predict.glm[PGA$sinc.predict.glm < 0] <- 0
+PGA$sinc.predict.glm <- tanh(PGA$sinc.predict.glm/125) * 125
+hist(PGA$sinc.predict.glm)
+  
+PGA$rss[is.na(PGA$rss)] <- max(PGA$rss, na.rm = T)
+PGA$correctie[is.na(PGA$correctie)] <- median(PGA$correctie, na.rm = T)
+
+tb <- PGA@data %>%
+  group_by(ID) %>% mutate(r = row_number()) %>% filter(r == 1)
+
+# als de asset in de nabijeid van een storing is, dan wordt de leeftijd van de asset 5 jaar ouder ingeschat
+tb$Leeftijd[tb$EAN %in% PGA.E$EAN[!is.na(PGA.E$zakking) | !is.na(PGA.E$corrosie)]] <-
+  tb$Leeftijd[tb$EAN %in% PGA.E$EAN[!is.na(PGA.E$zakking) | !is.na(PGA.E$corrosie)]] + 5
+
+save(tb, file= './tmp/tb.Rda')
+
+failure.start <- FailureModeZakking(tb, jr = periode, exp. = tb$time.factor) %>%
+  left_join(FailureModeCorrosie(tb, jr = periode)) %>%
+  left_join(FailureModeAlgemeen(tb, jr = periode)) %>%
+  mutate(Fx =  1 - (prob.zak * prob.cor * prob.algem)) %>% # betrouwbaarheid
+  
+  group_by(ID) %>% arrange(jr) %>%
+  mutate(fx = lead(Fx) - Fx) %>% # Faalkansverdeling 
+  mutate(px = 1 - (fx / (1-Fx))) %>% #survival reate, (1- hazard rate) of conditionele survival prob 
+  filter(!is.na(px)) %>%
+  mutate(kpx = cumprod(px)) %>% # kPt
+  select(ID, jr, kpx)
+  
+save(failure.start, file = './tmp/failure.start.Rda')
+```
+
+```{r failure effect}
+
+risc.table <- CalculateRisc(storingen)
+effect.euro <- sum(risc.table$Effect_getal[risc.table$Cluster == "Conditie PGA algemeen"], na.rm = T) * 1000
+storing.model <- sum((1-failure.start$kpx[failure.start$jr == 1]), na.rm = T) 
+
+effect.bsi <- huidig.bsi / storing.model # effect.bsi * (huidig.bsi/model.bsi)
+cost.failure <- cost.replacement*(4/5) + effect.euro
+
+print(paste("vervangen vanaf: ", round(cost.replacement/cost.failure,2)))
+```
+
+```{r life table}
+# create life table
+life.table <- failure.start %>%
+  group_by(ID) %>% arrange(-jr) %>%
+  mutate(E = cumsum(kpx)) %>% 
+  group_by(ID) %>% arrange(jr) %>%
+  mutate(cost.replacement.netto = 
+           (NP(rt = cost.replacement, t = jr, i = interest.rate))  -
+           (NP(rt = (1 - kpx) * cost.failure, t = jr, i = interest.rate))) %>% # cost.risc.NC
+  mutate(safety.exp = (1-kpx) * effect.bsi)
+
+save(life.table, file = './tmp/life.table.Rda')
+```
+
+```{r optimal replace}
+optimal.replace <- life.table %>% 
+  select(ID, jr, cost.replacement.netto) %>%
+  group_by(ID) %>% arrange(abs(cost.replacement.netto)) %>%
+  mutate(rank=row_number()) %>%
+  filter(rank == 1) %>% select(ID, jr) %>%
+  rename(optimal.replace = jr)
+
+life.expectancy <- life.table[life.table$jr == 0,] %>%
+  group_by(ID) %>% summarise(life.expectancy = max(E, na.rm = T),
+                             fx = max((1 - kpx), na.rm = T))
+
+failure.expetation <- life.table[life.table$jr %in% c(1, 3, 7),] %>%
+  select(ID, jr, kpx) %>% 
+  mutate(bsi = (1 - kpx) * effect.bsi)%>%
+  mutate(jr = paste("bsi","jr", jr, sep = ".")) %>%
+  select(ID, jr, bsi) %>% spread(key = jr, value = bsi)
+
+PGA.out.tmp <- tb %>%
+  mutate(GC_Code.onb = ifelse(grepl("GC", GC_Code), F, T)) %>%
+  mutate(sd = round(rss,0)) %>%
+  
+  select(ID, pc6 = POST_C, X, Y, Leeftijd, sinc.predict.glm, MaximaleZakking, GC_Code, GC_Code.onb, sd) %>%
+  left_join(optimal.replace) %>%
+  left_join(life.expectancy) %>%
+  left_join(failure.expetation) %>%
+  left_join(PGA.E@data[, colnames(PGA.E@data) %in% c("ID", "zakking", "corrosie")]) %>%
+  mutate(verv = min(life.expectancy, optimal.replace, na.rm = T))
+save(PGA.out.tmp, file = './tmp/PGA.out.tmp.Rda')
+```
+
+```{r labels}
+PGA.out <- PGA.out.tmp %>%
+  group_by(ID) %>% mutate(r = row_number()) %>% filter(r == 1)
+
+#labels toekennen
+PGA.out[["label"]] <- "4:25>"
+
+PGA.out$label[PGA.out$optimal.replace < 25] <- "3:8-24"
+PGA.out$label[PGA.out$optimal.replace < 8] <- "2:4-7"
+PGA.out$label[PGA.out$optimal.replace < 4] <- "1:1-3"
+
+PGA.out$label[PGA.out$GC_Code %in% c("GC0", "GC1", "GC2")] <- "1:p.1"
+
+PGA.out$label[!is.na(PGA.out$corrosie) & PGA.out$optimal.replace < 11 ] <- "1:p.2c"
+PGA.out$label[!is.na(PGA.out$zakking)  & PGA.out$optimal.replace < 11] <- "1:p.2z"
+
+# p.1 en 1:1-3 binnen nu en 3 jaar vervangen
+PGA.out$optimal.replace[PGA.out$label %in% c("1:1-3", "1:p.1")] <- 
+  sample(1:3, replace = T, size = nrow(PGA.out[PGA.out$label %in% c("1:1-3", "1:p.1") ,]))
+
+# p.1 en 1:1-3 binnen nu en 5 jaar vervangen
+PGA.out$optimal.replace[PGA.out$label %in% c("1:p.2c", "1:p.2z")] <- 
+  sample(1:5, replace = T, size = nrow(PGA.out[PGA.out$label %in% c("1:p.2c", "1:p.2z") ,]))
+```
+
+```{r optimal replace, fig.height=6}
+PGA.out[PGA.out$optimal.replace > 0 & PGA.out$optimal.replace < 31,] %>% 
+  group_by(optimal.replace) %>% 
+  summarise(Aantal = n()) %>% 
+  ggplot(aes(optimal.replace, Aantal)) + 
+  geom_smooth(method = MASS::rlm) + geom_line() + 
+  labs(title = "optimal replacement year pga", subtitle = "cumulative per year") 
+
+```
+
+```{r bsi pareto, fig.height=6}
+tmp <- PGA.out@data %>% 
+  group_by(Leeftijd) %>% 
+  summarise(bsi = sum(bsi.jr.1, na.rm = T),
+            aantal = n()) %>%
+  arrange(-Leeftijd) %>%
+  mutate(bsi.cumulatief = cumsum(bsi),
+         aantal.cumulatief = cumsum(aantal)) %>%
+  # create percentage
+  mutate(bsi.cumulatief = (bsi.cumulatief/ max(bsi.cumulatief))* max(aantal),
+         aantal.cumulatief = (aantal.cumulatief/ max(aantal.cumulatief))* max(aantal)) %>%
+  filter(Leeftijd < 51) 
+
+tmp %>%
+  ggplot(aes(x = Leeftijd)) + 
+  geom_bar(stat = "identity", fill = "white", colour = "black", aes(y = aantal)) +
+  geom_line(aes(y = aantal.cumulatief, col = "aantal.PGA.cumulatief")) + 
+  geom_line(aes(y = bsi.cumulatief, col = "bsi.cumulatief")) + 
+  scale_x_reverse()+
+  labs(title = paste("BSI overzicht",year, sep = " - "), 
+       subtitle = "Cumulatief veiligheidsrisico",
+       y = "Aantal",
+       x = "Leeftijd",
+       colour = "Legenda: ") +
+  scale_y_continuous(sec.axis = sec_axis(~ . / max(tmp$aantal)*100 , name = "percentage [%]")) +
+  theme(legend.position="bottom")
+  
+```
+
+```{r toestand, fig.height=6}
+PGA.out[["Toestand"]] <- NA
+
+#start kwalificatie
+PGA.start <- PGA.out
+PGA.start$Toestand[PGA.start$life.expectancy < (6+1) ] <- 1 #"1:Matig" # plus 1 omdat de data oud is
+PGA.start$Toestand[ PGA.start$Leeftijd <6 & is.na(PGA.start$Toestand)] <- 4 #"4:Als Nieuw"
+PGA.start$Toestand[ PGA.start$life.expectancy > 16 & is.na(PGA.start$Toestand) ] <- 3 #"3:Goed"
+PGA.start$Toestand[ is.na(PGA.start$Toestand) ] <- 2 #"2:Voldoende"
+
+tab.1 <- PGA.start %>% group_by(Toestand = as.character(Toestand)) %>% 
+  summarise(perc = n()/ nrow(PGA.start)) %>% mutate(Groep = "1:start.kwalificatie")
+
+# bsi kwalificatie
+PGA.bsi <- PGA.out
+PGA.bsi$BSI <- PGA.bsi$bsi.jr.1 
+PGA.bsi$Toestand[PGA.bsi$Leeftijd < 8 ] <- 4 #"4:Als Nieuw"
+PGA.bsi$Toestand[PGA.bsi$BSI < 1.15e-05 & is.na(PGA.bsi$Toestand) ] <- 3#"3:Goed"
+PGA.bsi$Toestand[PGA.bsi$BSI < 1.7e-04 & is.na(PGA.bsi$Toestand) ] <- 2#"2:Voldoende"
+PGA.bsi$Toestand[is.na(PGA.bsi$Toestand) ] <- 1#"1:Matig"
+
+tab.2 <- PGA.bsi %>% group_by(Toestand = as.character(Toestand)) %>% 
+  summarise(perc = n()/ nrow(PGA.bsi)) %>% mutate(Groep = "2:bsi.kwalificatie")
+
+# Corrosie gevoelig
+PGA.cor <- PGA.start
+PGA.cor$Toestand[ PGA.cor$GC_Code %in% GC_roest & PGA.cor$Toestand > 2 & PGA.cor$GC_Code != "Onbekend" & PGA.cor$Leeftijd > 10] <- 2
+
+tab.3 <- PGA.cor %>% group_by(Toestand = as.character(Toestand)) %>% 
+  summarise(perc = n()/ nrow(PGA.cor)) %>% 
+  mutate(Groep = "3:corrosie.kwalificatie")
+
+# Storing in omgeving
+PGA.storing <- PGA.start
+PGA.storing$Toestand[ !is.na(PGA.storing$corrosie)|  !is.na(PGA.storing$zakking)] <- 
+  PGA.storing$Toestand[ !is.na(PGA.storing$corrosie)|  !is.na(PGA.storing$zakking) ] -1
+PGA.storing$Toestand[ PGA.storing$label %in% c("1:1-3", "1:p.1", "1:p.2c", "1:p.2z", "2:4-7")] <- 1
+
+tab.4 <- PGA.storing %>% group_by(Toestand = as.character(Toestand)) %>% 
+  summarise(perc = n()/ nrow(PGA.storing)) %>% 
+  mutate(Groep = "4:storing.kwalificatie")
+
+# eind kwalificatie
+tab.5 <- rbind(PGA.storing, PGA.cor) %>%
+  group_by(ID) %>% summarise(Toestand = min(Toestand, na.rm = T)) %>%
+  group_by(Toestand) %>% summarise(perc = n()/ nrow(PGA.storing)) %>%
+  mutate(Groep = "5:Eind.kwalificatie")
+
+toestand <- rbind(tab.1, tab.2, tab.3, tab.4, tab.5) %>% 
+  mutate(Toestand = ifelse(Toestand == 1, "1_Matig", 
+                        ifelse(Toestand == 2,"2_Voldoende", 
+                               ifelse(Toestand == 3, "3_Goed", 
+                                      ifelse(Toestand == 4,"4_Als Nieuw", NA))))) %>%
+  filter(!is.na(Toestand))
+
+write.csv(toestand, file = paste0(out.folder, "toestand.csv"))
+
+toestand %>% ggplot(aes(x=Groep, y = perc, fill = Toestand)) +
+           geom_bar(position = "fill", stat='identity',  width = .7) +
+  #scale_x_continuous(labels = scales::percent_format()) +
+  coord_flip()
+
+rm(PGA.storing, PGA.cor, PGA.start, PGA.bsi, tab.1, tab.2, tab.3, tab.4, tab.5)
+
+PGA.out <- SpatialPointsDataFrame(PGA.out[,c("X", "Y")], PGA.out, proj4string = CRS(epsg$prj4[epsg$note == "# Amersfoort / RD New"]))
+```
+
+```{r write files}
+maptools::writeSpatialShape(PGA.out, "./Output/pga_restlevensduur")
+wkt <- readLines("C:/EigenData/ArcGIS/esri_wkt_28992.prj.txt")
+cat(wkt,file=file.path("./Output/pga_restlevensduur.prj"))
+
+saveRDS(PGA.out, './Output/PGA.out.Rda')
+write.csv(PGA.out, file = './Output/PGA.csv')
+
+# naar de s: schijf
+#maptools::writeSpatialShape(PGA.out, "S:/Stedin/Techniek/AM/Afdelingen/RM-PM/1.1.10 Werkmappen/Marco Bunt/2019/Trnsfr/PGA.restlevensduur/pga_restlevensduur")
+#wkt <- readLines("C:/EigenData/ArcGIS/esri_wkt_28992.prj.txt")
+#cat(wkt,file=file.path("S:/Stedin/Techniek/AM/Afdelingen/RM-PM/1.1.10 Werkmappen/Marco Bunt/2019/Trnsfr/PGA.restlevensduur/pga_restlevensduur.prj"))
+
+#saveRDS(PGA.out, 'S:/Stedin/Techniek/AM/Afdelingen/RM-PM/1.1.10 Werkmappen/Marco Bunt/2019/Trnsfr/PGA.restlevensduur/PGA.out.Rda')
+#write.csv(PGA.out@data, file = 'S:/Stedin/Techniek/AM/Afdelingen/RM-PM/1.1.10 Werkmappen/Marco Bunt/2019/Trnsfr/PGA.restlevensduur/PGA.csv')
+```
+
+```{r fo gebieden}
+ fo.trail <- FO_Generator(PGA = PGA.out,
+                          drempel = 25000,
+                          v.insp = v.inspectie)
+
+mapview::mapview(fo.trail)
+
+maptools::writeSpatialShape(fo.trail, "./Output/fo_trail")
+wkt <- readLines("C:/EigenData/ArcGIS/esri_wkt_28992.prj.txt")
+cat(wkt,file=file.path("./Output/fo_trail"))
+
+```
+
+```{r BSI monitor, fig.height=4}
+horizon.vervang <- 31
+
+optimal.replace.euro <- PGA.out@data %>% 
+  group_by(optimal.replace) %>% summarise(aantal = n() )
+
+bsi.table <- life.table
+bsi.table[["measure.euro"]] <- bsi.table$safety.exp
+bsi.table[["measure.bsi"]] <- bsi.table$safety.exp
+
+PGA.out@data[["replace.euro"]] <- NA
+PGA.out@data[["replace.bsi"]] <- NA
+
+
+for(i in 1:horizon.vervang){
+  cat(i)
+  ids.bsi <- bsi.table[ which(bsi.table$jr == i), ] %>% 
+    group_by(jr) %>%
+    arrange(measure.bsi) %>% 
+    mutate(bsi.cum = cumsum(measure.bsi)) %>%
+    filter(bsi.cum > huidig.bsi)
+     
+  #print(paste("Aantal replace bsi jaar ", i, ": ",nrow(bsi.table[bsi.table$jr == i & bsi.table$ID %in% ids.bsi$ID,])))
+  bsi.table$measure.bsi[bsi.table$jr >= i & bsi.table$ID %in% ids.bsi$ID] <- 0
+  PGA.out@data$replace.bsi[PGA.out@data$ID %in% ids.bsi$ID] <- i
+  
+  ids.euro <- bsi.table[ which(bsi.table$jr == i), ] %>% 
+    group_by(jr) %>% 
+    arrange(-measure.euro) %>% 
+    mutate(r = row_number()) %>%
+    filter(r <= max(optimal.replace.euro$aantal[optimal.replace.euro$optimal.replace == i], na.rm = T)) 
+  
+  #print(paste("Aantal replace euro jaar ", i, ": ",nrow(bsi.table[bsi.table$jr == i & bsi.table$ID %in% ids.euro$ID, ])))
+  bsi.table$measure.euro[bsi.table$jr >= i & bsi.table$ID %in% ids.euro$ID] <- 0
+  PGA.out@data$replace.euro[PGA.out@data$ID %in% ids.euro$ID] <- i
+
+}
+
+veiligheid <- bsi.table[which(bsi.table$jr < horizon.vervang & bsi.table$jr > 0),] %>%
+  group_by(jr) %>% 
+  summarise(expsure = sum(safety.exp, na.rm = T),
+            measure.euro = sum(measure.euro, na.rm = T),
+            measure.bsi = sum(measure.bsi, na.rm = T))
+  
+
+aantallen <- PGA.out@data[, colnames(PGA.out@data) %in% c("jr", "replace.euro", "replace.bsi")] %>%
+  gather(key = "driver", value = "jr") %>%
+  filter(!is.na(jr)) %>%
+  group_by(driver, jr) %>% summarise(aantal = n()) %>%
+  filter(!is.na(aantal) & !is.na(jr))
+
+aantallen %>% spread(key = jr, value = aantal)
+```
+
+```{r bsi}
+
+veiligheid %>% ggplot(aes(x = jr)) +
+  geom_line(aes(y = expsure, col = "bsi.no.measure")) + 
+  geom_line(aes(y = measure.euro, col = "bsi.replace.euro")) + 
+  geom_line(aes(y = measure.bsi, col = "bsi.replace.safe"))
+
+```
+
+```{r aantal}
+aantallen %>% ggplot(aes(x = jr, y = aantal, col = driver)) +geom_line()
+
+```
+
+```{r}
+
+PGA.out@data[, colnames(PGA.out@data) %in% c("sd", "replace.euro", "replace.bsi")] %>%
+  #mutate(sd = round(sd/3,0)*3) %>% 
+  gather(key = "driver", value = "verv.jr", -sd) %>% filter(!is.na(verv.jr)) %>%
+  group_by(driver, sd, verv.jr) %>% summarise(aantal = n()) %>%
+  ggplot(aes(verv.jr, aantal, fill = as.factor(sd))) + geom_area() + facet_wrap(~driver, scales = "free")
+
+```
+
